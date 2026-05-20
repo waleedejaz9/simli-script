@@ -28,9 +28,9 @@ app.post("/api/simli-token", async (req, res) => {
       apiKey: process.env.SIMLI_API_KEY,
       config: {
         faceId: process.env.SIMLI_FACE_ID,
-        handleSilence: false,
-        maxSessionLength: 600,
-        maxIdleTime: 180,
+        handleSilence: true,
+        maxSessionLength: 1800,
+        maxIdleTime: 600,
       },
     });
 
@@ -42,20 +42,39 @@ app.post("/api/simli-token", async (req, res) => {
 });
 
 async function getElevenLabsSignedUrl() {
+  const agentId = process.env.ELEVENLABS_AGENT_ID;
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+
+  if (!agentId) {
+    throw new Error("Missing ELEVENLABS_AGENT_ID in .env");
+  }
+
+  if (!apiKey) {
+    throw new Error("Missing ELEVENLABS_API_KEY in .env");
+  }
+
   const response = await fetch(
-    `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${process.env.ELEVENLABS_AGENT_ID}`,
+    `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${agentId}`,
     {
       method: "GET",
       headers: {
-        "xi-api-key": process.env.ELEVENLABS_API_KEY,
+        "xi-api-key": apiKey,
       },
-    },
+    }
   );
 
-  const data = await response.json();
+  const data = await response.json().catch(() => null);
 
   if (!response.ok) {
-    throw new Error("Failed to get ElevenLabs signed URL");
+    console.error("ELEVENLABS SIGNED URL ERROR STATUS:", response.status);
+    console.error("ELEVENLABS SIGNED URL ERROR BODY:", data);
+
+    throw new Error(
+      data?.detail?.message ||
+        data?.message ||
+        data?.detail ||
+        "Failed to get ElevenLabs signed URL"
+    );
   }
 
   return data.signed_url;
