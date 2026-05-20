@@ -1,33 +1,52 @@
-import { SimliClient, LogLevel } from "simli-client";
+import { LogLevel, SimliClient } from "simli-client";
 
 console.log("MAIN JS LOADED");
-let isGreetingTurn = false;
+
+/*
+  OPTIMUM HYBRID FLOW
+  -------------------
+  Browser SpeechRecognition = detects if user is speaking + unclear speech check only
+  MediaRecorder = captures real user audio as WebM/Opus
+  Backend = decode audio → STT → LLM → TTS → PCM chunks
+  Simli = only receives timed PCM chunks
+*/
+
 let simliClient = null;
 let avatarWs = null;
 let mediaRecorder = null;
 let recordedChunks = [];
 let micStream = null;
-let audioContext = null;
-let analyser = null;
-let micSource = null;
-let vadInterval = null;
+let recognition = null;
+
+let simliAudioQueue = [];
+let isPlayingSimliQueue = false;
+let isAvatarSpeaking = false;
+
 let silenceInterval = null;
-let isPythonConnected = false;
+let listenRestartTimer = null;
+let finalSpeechTimer = null;
+let backendTurnTimeoutTimer = null;
+
 let appConfig = null;
 
 let isSessionActive = false;
 let isSimliConnected = false;
-let isUserSpeaking = false;
-let isRecordingTurn = false;
+let isPythonConnected = false;
 let isProcessingTurn = false;
+let isRecordingTurn = false;
+let isListening = false;
+let isGreetingTurn = false;
 
-let speechStartedAt = 0;
-let silenceStartedAt = 0;
+let pendingTranscript = "";
+let gotAnySpeech = false;
+let currentBackendTurn = null;
+let backendAudioChunksInTurn = 0;
 
-const VOLUME_THRESHOLD = 0.025;
-const MIN_SPEECH_MS = 400;
-const SILENCE_END_MS = 1300;
-const VAD_CHECK_MS = 100;
+const EXPRESS_BASE = "http://localhost:3000";
+
+const HUMAN_PAUSE_MS = 2300;
+const MIN_TRANSCRIPT_CHARS = 4;
+const BACKEND_TURN_TIMEOUT_MS = 30000;
 
 const videoEl = document.getElementById("avatarVideo");
 const audioEl = document.getElementById("avatarAudio");
@@ -35,45 +54,6 @@ const audioEl = document.getElementById("avatarAudio");
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const statusEl = document.getElementById("status");
-
-function seedLocalAuth() {
-  localStorage.setItem("authTimestamp", "1779086949149");
-
-  localStorage.setItem(
-    "authToken",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0IiwidHlwZSI6ImFjY2VzcyIsImV4cCI6MTc3OTMwMTU4NiwiaWF0IjoxNzc5MzAwOTg2fQ.tjIVSyCr95qb8dWR14Qy_uJLKSGAB9FEyo5BtPqYPcQ"
-  );
-
-  localStorage.setItem(
-    "authUser",
-    JSON.stringify({
-      email: "test@localhost.com",
-      user_id: "test",
-      api_key:
-        "5f69d08b59cee2840f29bd6e68de44db13f1ff892589c82eb8fcacbf626f0061",
-    })
-  );
-
-  localStorage.setItem("isAdmin", "true");
-  localStorage.setItem("isAuthenticated", "true");
-
-  localStorage.setItem(
-    "refreshToken",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0IiwidHlwZSI6InJlZnJlc2giLCJleHAiOjE3Nzk0NzM3ODYsImlhdCI6MTc3OTMwMDk4Nn0.Ud4MjA9f_NYkjPCWaDEYVp-PsgPzIBjYXioxuoWFIRA"
-  );
-
-  localStorage.setItem(
-    "tekkdev_session_id",
-    "7f164a67-e364-4952-9c63-6b09e017b0ee"
-  );
-
-  localStorage.setItem("user_id", "test");
-
-  console.log("AUTH SEEDED");
-}
-
-// Uncomment only for local temporary testing.
-// seedLocalAuth();
 
 function setStatus(text) {
   console.log("STATUS:", text);
@@ -104,7 +84,6 @@ function stripBearerPrefix(value) {
     ? raw.slice(7).trim()
     : raw;
 
-  // Important: removes hidden newline that caused %0A in URL
   return token.replace(/\s+/g, "");
 }
 
@@ -127,6 +106,17 @@ function getAuthData() {
   };
 }
 
+function getVoiceId() {
+  return (
+    localStorage.getItem("voice_id") ||
+    localStorage.getItem("avatar_voice_id") ||
+    localStorage.getItem("selectedVoiceId") ||
+    localStorage.getItem("elevenlabs_voice_id") ||
+    appConfig?.defaultVoiceId ||
+    ""
+  );
+}
+
 function normalizeWsBase(base) {
   return String(base || "")
     .trim()
@@ -147,7 +137,6 @@ function buildAvatarWsUrl(avatarId) {
   if (auth.userId) params.set("user_id", auth.userId);
 
   return `${wsBase}/ws/voice/stream?${params.toString()}`;
-  return `${wsBase}/ws/avatar/voice_stream?${params.toString()}`;
 }
 
 function hideTokenInUrl(url) {
@@ -187,8 +176,12 @@ function blobToBase64(blob) {
   });
 }
 
+function getSpeechRecognitionClass() {
+  return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+}
+
 async function loadConfig() {
-  const res = await fetch("http://localhost:3000/api/config");
+  const res = await fetch(`${EXPRESS_BASE}/api/config`);
   const data = await res.json();
 
   if (!res.ok) {
@@ -199,7 +192,7 @@ async function loadConfig() {
 }
 
 async function getSimliToken() {
-  const res = await fetch("http://localhost:3000/api/simli-token", {
+  const res = await fetch(`${EXPRESS_BASE}/api/simli-token`, {
     method: "POST",
   });
 
@@ -217,7 +210,7 @@ function startSimliKeepAlive() {
 
   silenceInterval = setInterval(() => {
     if (!simliClient || !isSimliConnected || !isSessionActive) return;
-    if (isProcessingTurn) return;
+    if (isProcessingTurn || isAvatarSpeaking) return;
 
     try {
       const silence = new Int16Array(160);
@@ -235,6 +228,54 @@ function stopSimliKeepAlive() {
   }
 }
 
+function clearBackendTurnTimeout() {
+  if (backendTurnTimeoutTimer) {
+    clearTimeout(backendTurnTimeoutTimer);
+    backendTurnTimeoutTimer = null;
+  }
+}
+
+function clearListenRestartTimer() {
+  if (listenRestartTimer) {
+    clearTimeout(listenRestartTimer);
+    listenRestartTimer = null;
+  }
+}
+
+function clearFinalSpeechTimer() {
+  if (finalSpeechTimer) {
+    clearTimeout(finalSpeechTimer);
+    finalSpeechTimer = null;
+  }
+}
+
+function queueSimliAudio(pcm, durationMs = 60) {
+  simliAudioQueue.push({ pcm, durationMs });
+
+  if (!isPlayingSimliQueue) {
+    playSimliQueue();
+  }
+}
+
+async function playSimliQueue() {
+  isPlayingSimliQueue = true;
+  isAvatarSpeaking = true;
+
+  stopListening();
+
+  while (simliAudioQueue.length > 0 && isSessionActive) {
+    const item = simliAudioQueue.shift();
+
+    if (simliClient && isSimliConnected) {
+      simliClient.sendAudioData(item.pcm);
+    }
+
+    await sleep(item.durationMs || 60);
+  }
+
+  isPlayingSimliQueue = false;
+}
+
 async function connectSimli() {
   const sessionToken = await getSimliToken();
 
@@ -243,23 +284,42 @@ async function connectSimli() {
     videoEl,
     audioEl,
     null,
-    LogLevel.DEBUG,
+    LogLevel.ERROR,
     "livekit"
   );
+
+  let startedResolve;
+  let startedReject;
+
+  const startedPromise = new Promise((resolve, reject) => {
+    startedResolve = resolve;
+    startedReject = reject;
+  });
 
   simliClient.on("start", () => {
     isSimliConnected = true;
     setStatus("Simli connected");
     startSimliKeepAlive();
+    startedResolve();
   });
 
   simliClient.on("error", (err) => {
     console.error("SIMLI ERROR:", err);
     isSimliConnected = false;
     setStatus("Simli error");
+    startedReject(err);
   });
 
   await simliClient.start();
+
+  await Promise.race([
+    startedPromise,
+    sleep(20000).then(() => {
+      if (!isSimliConnected) {
+        throw new Error("Timed out waiting for Simli start event");
+      }
+    }),
+  ]);
 }
 
 function connectPythonAvatarWs() {
@@ -281,50 +341,52 @@ function connectPythonAvatarWs() {
 
     let resolved = false;
 
-avatarWs.onopen = () => {
-  console.log("PYTHON WS CONNECTED");
+    avatarWs.onopen = () => {
+      console.log("PYTHON WS CONNECTED");
 
-  isPythonConnected = true;
-  resolved = true;
+      isPythonConnected = true;
+      resolved = true;
 
-  resolve();
-};
+      resolve();
+    };
 
     avatarWs.onmessage = async (event) => {
       try {
         if (event.data instanceof ArrayBuffer) {
           if (!simliClient || !isSimliConnected) return;
 
+          backendAudioChunksInTurn += 1;
           isProcessingTurn = true;
           setStatus("avatar speaking");
 
-          simliClient.sendAudioData(new Int16Array(event.data));
+          queueSimliAudio(new Int16Array(event.data), 60);
           return;
         }
 
         const msg = JSON.parse(event.data);
         console.log("PYTHON WS EVENT:", msg.type, msg);
 
-   if (msg.type === "transcript") {
-  const heardText = msg.text || msg.transcript || "";
+        if (msg.type === "status") {
+          if (msg.stage) setStatus(msg.stage);
+          return;
+        }
 
-  console.log("TRANSCRIPT:", heardText);
+        if (msg.type === "transcript") {
+          const heardText = msg.text || msg.transcript || "";
 
-  // Do not validate greeting as user speech
-  if (isGreetingTurn) {
-    setStatus("greeting user");
-    return;
-  }
+          console.log("BACKEND TRANSCRIPT:", heardText);
 
-  if (!heardText || heardText.trim().length < 3) {
-    setStatus("not heard properly");
-    sendTextToBackend("Sorry, I didn't hear that properly. Please say it again.");
-    return;
-  }
+          if (isGreetingTurn) {
+            setStatus("greeting user");
+            return;
+          }
 
-  setStatus(`heard: ${heardText}`);
-  return;
-}
+          if (heardText.trim()) {
+            setStatus(`heard: ${heardText}`);
+          }
+
+          return;
+        }
 
         if (
           msg.type === "llm_text_delta" ||
@@ -335,67 +397,68 @@ avatarWs.onopen = () => {
           return;
         }
 
-if (
-  msg.type === "audio_chunk" ||
-  msg.type === "tts_audio_chunk" ||
-  msg.type === "avatar_audio_chunk"
-) {
-  const base64 =
-    msg.pcm_b64 ||
-    msg.audio ||
-    msg.audio_base64 ||
-    msg.data ||
-    msg.chunk;
+        if (msg.type === "llm_text_final" || msg.type === "assistant_final") {
+          if (msg.text && msg.text.trim()) {
+            console.log("ASSISTANT TEXT:", msg.text);
+          }
+          return;
+        }
 
-  if (!base64) {
-    console.warn("NO AUDIO BASE64 FOUND:", msg);
-    return;
-  }
+        if (
+          msg.type === "audio_chunk" ||
+          msg.type === "tts_audio_chunk" ||
+          msg.type === "avatar_audio_chunk"
+        ) {
+          const base64 =
+            msg.pcm_b64 ||
+            msg.audio ||
+            msg.audio_base64 ||
+            msg.data ||
+            msg.chunk;
 
-  if (!simliClient || !isSimliConnected) {
-    console.warn("SIMLI NOT READY FOR AUDIO");
-    return;
-  }
+          if (!base64) {
+            console.warn("NO AUDIO BASE64 FOUND:", msg);
+            return;
+          }
 
-  isProcessingTurn = true;
-  setStatus("avatar speaking");
+          const pcm = base64ToInt16Array(base64);
 
-  const pcm = base64ToInt16Array(base64);
+          backendAudioChunksInTurn += 1;
+          isProcessingTurn = true;
+          setStatus("avatar speaking");
 
-  console.log("SENDING PCM TO SIMLI:", pcm.length);
+          queueSimliAudio(pcm, msg.duration_ms || 60);
+          return;
+        }
 
-  simliClient.sendAudioData(pcm);
-
-  return;
-}
-
-if (
-  msg.type === "audio_end" ||
-  msg.type === "turn_complete" ||
-  msg.type === "done" ||
-  msg.type === "tts_audio_end" ||
-  msg.type === "avatar_audio_end"
-) {
-
-  if (isGreetingTurn) {
-    isGreetingTurn = false;
-  }
-
-  await sleep(700);
-
-  isProcessingTurn = false;
-
-  if (isSessionActive) {
-    setStatus("listening");
-  }
-
-  return;
-}
+        if (
+          msg.type === "audio_end" ||
+          msg.type === "turn_complete" ||
+          msg.type === "done" ||
+          msg.type === "tts_audio_end" ||
+          msg.type === "avatar_audio_end"
+        ) {
+          await handleBackendAudioEnd(msg);
+          return;
+        }
 
         if (msg.type === "error") {
           console.error("PYTHON BACKEND ERROR:", msg);
+
           isProcessingTurn = false;
-          setStatus(msg.message || "backend error");
+          isGreetingTurn = false;
+          isAvatarSpeaking = false;
+          currentBackendTurn = null;
+          backendAudioChunksInTurn = 0;
+          clearBackendTurnTimeout();
+
+          setStatus(msg.message || msg.error || "backend error");
+
+          if (isSessionActive) {
+            scheduleListening(1200);
+          }
+
+          return;
         }
       } catch (err) {
         console.error("WS MESSAGE ERROR:", err, event.data);
@@ -428,7 +491,50 @@ if (
   });
 }
 
-async function setupMicAndVad() {
+async function handleBackendAudioEnd(msg = {}) {
+  clearBackendTurnTimeout();
+
+  const chunksFromBackend =
+    Number(msg.chunks_sent || msg.chunks || msg.audio_chunks || 0) ||
+    backendAudioChunksInTurn;
+
+  console.log("BACKEND AUDIO END:", {
+    currentBackendTurn,
+    chunksFromBackend,
+    msg,
+  });
+
+  if (chunksFromBackend <= 0) {
+    isProcessingTurn = false;
+    isGreetingTurn = false;
+    isAvatarSpeaking = false;
+    currentBackendTurn = null;
+    backendAudioChunksInTurn = 0;
+
+    setStatus("backend returned no audio");
+    scheduleListening(800);
+    return;
+  }
+
+  while (isPlayingSimliQueue || simliAudioQueue.length > 0) {
+    await sleep(100);
+  }
+
+  await sleep(300);
+
+  isAvatarSpeaking = false;
+  isProcessingTurn = false;
+  isGreetingTurn = false;
+  currentBackendTurn = null;
+  backendAudioChunksInTurn = 0;
+
+  if (isSessionActive) {
+    setStatus("listening");
+    scheduleListening(300);
+  }
+}
+
+async function setupMic() {
   micStream = await navigator.mediaDevices.getUserMedia({
     audio: {
       echoCancellation: true,
@@ -437,35 +543,7 @@ async function setupMicAndVad() {
     },
   });
 
-  audioContext = new AudioContext();
-
-  if (audioContext.state === "suspended") {
-    await audioContext.resume();
-  }
-
-  analyser = audioContext.createAnalyser();
-  analyser.fftSize = 2048;
-
-  micSource = audioContext.createMediaStreamSource(micStream);
-  micSource.connect(analyser);
-
   setStatus("mic ready");
-}
-
-function getMicVolume() {
-  if (!analyser) return 0;
-
-  const data = new Uint8Array(analyser.fftSize);
-  analyser.getByteTimeDomainData(data);
-
-  let sum = 0;
-
-  for (let i = 0; i < data.length; i++) {
-    const value = (data[i] - 128) / 128;
-    sum += value * value;
-  }
-
-  return Math.sqrt(sum / data.length);
 }
 
 function startTurnRecording() {
@@ -481,122 +559,336 @@ function startTurnRecording() {
 
   mediaRecorder = new MediaRecorder(micStream, { mimeType });
 
-mediaRecorder.onstop = async () => {
-  try {
-    if (!recordedChunks || recordedChunks.length === 0) {
-      console.warn("No recorded audio chunks found");
-      return;
+  mediaRecorder.ondataavailable = (event) => {
+    if (event.data && event.data.size > 0) {
+      recordedChunks.push(event.data);
     }
+  };
 
-    const auth = getAuthData();
+  mediaRecorder.onstop = async () => {
+    try {
+      isRecordingTurn = false;
 
-    const audioBlob = new Blob(recordedChunks, {
-      type: mediaRecorder.mimeType || "audio/webm",
-    });
+      if (!recordedChunks || recordedChunks.length === 0) {
+        console.warn("No recorded audio chunks found");
+        isProcessingTurn = false;
+        scheduleListening(800);
+        return;
+      }
 
-    recordedChunks = [];
+      const audioBlob = new Blob(recordedChunks, {
+        type: mediaRecorder.mimeType || "audio/webm",
+      });
 
-    if (!audioBlob.size) {
-      console.warn("Audio blob is empty");
-      return;
-    }
+      recordedChunks = [];
 
-    const base64Audio = await blobToBase64(audioBlob);
+      if (!audioBlob.size) {
+        console.warn("Audio blob is empty");
+        isProcessingTurn = false;
+        scheduleListening(800);
+        return;
+      }
 
-    if (!base64Audio) {
-      console.warn("Base64 audio is empty");
-      return;
-    }
+      const base64Audio = await blobToBase64(audioBlob);
 
-    avatarWs.send(
-      JSON.stringify({
-        type: "audio",
-        audio_b64: base64Audio,
+      if (!base64Audio) {
+        console.warn("Base64 audio is empty");
+        isProcessingTurn = false;
+        scheduleListening(800);
+        return;
+      }
+
+      const auth = getAuthData();
+      const voiceId = getVoiceId();
+
+      currentBackendTurn = "user";
+      backendAudioChunksInTurn = 0;
+
+      const payload = {
+        type: "user_audio",
         audio_base64: base64Audio,
-        audio: base64Audio,
         mime_type: mediaRecorder.mimeType || "audio/webm",
-        format: "webm",
+        format: "webm_opus",
+
         session_id: auth.sessionId,
         user_id: auth.userId,
-      })
-    );
+        avatar_id: appConfig?.defaultAvatarId || "ai_engineer",
 
-    console.log("FINAL AUDIO SENT:", {
-      blobSize: audioBlob.size,
-      mimeType: mediaRecorder.mimeType,
-      base64Length: base64Audio.length,
-    });
-  } catch (err) {
-    console.error("FINAL AUDIO SEND ERROR:", err);
-  }
-};
+        voice_id: voiceId,
+        voiceId: voiceId,
+        avatar_voice_id: voiceId,
+        tts_voice_id: voiceId,
+        elevenlabs_voice_id: voiceId,
 
-  mediaRecorder.start();
+        control_transcript: pendingTranscript.trim(),
+      };
+
+      avatarWs.send(JSON.stringify(payload));
+
+      console.log("WEBM AUDIO SENT TO BACKEND:", {
+        type: payload.type,
+        mime_type: payload.mime_type,
+        format: payload.format,
+        audioLength: payload.audio_base64.length,
+        session_id: payload.session_id,
+        user_id: payload.user_id,
+        avatar_id: payload.avatar_id,
+        voice_id: payload.voice_id,
+        control_transcript: payload.control_transcript,
+      });
+
+      setStatus("processing your voice");
+      startBackendTurnTimeout();
+    } catch (err) {
+      console.error("FINAL AUDIO SEND ERROR:", err);
+      isProcessingTurn = false;
+      scheduleListening(1000);
+    }
+  };
+
+  mediaRecorder.start(250);
 
   isRecordingTurn = true;
-  isUserSpeaking = true;
-  speechStartedAt = Date.now();
-  silenceStartedAt = 0;
-
   setStatus("hearing you");
 }
 
-function stopTurnRecording() {
+function stopTurnRecording({ discard = false } = {}) {
   if (!mediaRecorder || !isRecordingTurn) return;
+
+  if (discard) {
+    recordedChunks = [];
+  }
 
   try {
     mediaRecorder.stop();
   } catch (err) {
     console.error("MEDIA RECORDER STOP ERROR:", err);
+    isRecordingTurn = false;
   }
 }
 
-function startVadLoop() {
-  if (vadInterval) return;
+function isValidControlTranscript(text) {
+  const cleaned = String(text || "")
+    .toLowerCase()
+    .replace(/[^\w\s]/g, "")
+    .trim();
 
-  vadInterval = setInterval(() => {
-    if (!isSessionActive) return;
-    if (isProcessingTurn) return;
-    if (!isPythonConnected) return;
-    if (!avatarWs || avatarWs.readyState !== WebSocket.OPEN) return;
+  const words = cleaned.split(/\s+/).filter(Boolean);
 
-    const volume = getMicVolume();
-    const now = Date.now();
+  return cleaned.length >= MIN_TRANSCRIPT_CHARS && words.length >= 1;
+}
 
-    if (volume >= VOLUME_THRESHOLD) {
-      silenceStartedAt = 0;
+async function askUserToRepeat() {
+  if (!isSessionActive) return;
+
+  stopListening();
+
+  await sendBackendTextAsSpeech(
+    "Please say that again. I couldn’t understand clearly.",
+    "repeat"
+  );
+}
+
+function scheduleListening(delay = 800) {
+  clearListenRestartTimer();
+
+  if (!isSessionActive) return;
+  if (isProcessingTurn) return;
+  if (!isPythonConnected) return;
+  if (isAvatarSpeaking) return;
+
+  listenRestartTimer = setTimeout(() => {
+    startListening();
+  }, delay);
+}
+
+function stopListening() {
+  clearFinalSpeechTimer();
+
+  if (recognition) {
+    try {
+      recognition.onstart = null;
+      recognition.onresult = null;
+      recognition.onerror = null;
+      recognition.onend = null;
+      recognition.onspeechstart = null;
+      recognition.onspeechend = null;
+      recognition.stop();
+    } catch {}
+
+    recognition = null;
+  }
+
+  isListening = false;
+}
+
+function startListening() {
+  if (!isSessionActive) return;
+  if (isProcessingTurn) return;
+  if (isListening) return;
+  if (!isPythonConnected) return;
+  if (isAvatarSpeaking) return;
+  if (!avatarWs || avatarWs.readyState !== WebSocket.OPEN) return;
+
+  const SpeechRecognition = getSpeechRecognitionClass();
+
+  if (!SpeechRecognition) {
+    setStatus("browser speech recognition not supported");
+    return;
+  }
+
+  pendingTranscript = "";
+  gotAnySpeech = false;
+
+  recognition = new SpeechRecognition();
+
+  recognition.lang = "en-US";
+  recognition.interimResults = true;
+  recognition.continuous = true;
+  recognition.maxAlternatives = 1;
+
+  recognition.onstart = () => {
+    isListening = true;
+    setStatus("listening");
+  };
+
+  recognition.onspeechstart = () => {
+    gotAnySpeech = true;
+    clearFinalSpeechTimer();
+
+    if (!isRecordingTurn) {
+      startTurnRecording();
+    }
+
+    setStatus("hearing you");
+  };
+
+  recognition.onresult = (event) => {
+    let finalTranscript = "";
+    let interimTranscript = "";
+
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      const text = result[0]?.transcript?.trim() || "";
+
+      if (result.isFinal) {
+        finalTranscript += ` ${text}`;
+      } else {
+        interimTranscript += ` ${text}`;
+      }
+    }
+
+    const spokenText = `${finalTranscript} ${interimTranscript}`.trim();
+
+    if (spokenText) {
+      gotAnySpeech = true;
 
       if (!isRecordingTurn) {
         startTurnRecording();
       }
 
+      if (finalTranscript.trim()) {
+        pendingTranscript = finalTranscript.trim();
+      }
+
+      setStatus("hearing you");
+
+      clearFinalSpeechTimer();
+
+      finalSpeechTimer = setTimeout(() => {
+        finishUserTurn();
+      }, HUMAN_PAUSE_MS);
+    }
+  };
+
+  recognition.onspeechend = () => {
+    clearFinalSpeechTimer();
+
+    finalSpeechTimer = setTimeout(() => {
+      finishUserTurn();
+    }, HUMAN_PAUSE_MS);
+  };
+
+  recognition.onerror = async (err) => {
+    console.error("SPEECH RECOGNITION ERROR:", err);
+
+    const errorName = err?.error || "";
+
+    isListening = false;
+    recognition = null;
+
+    if (!isSessionActive || isProcessingTurn || isAvatarSpeaking) return;
+
+    if (errorName === "no-speech") {
+      if (isRecordingTurn) {
+        stopTurnRecording({ discard: true });
+      }
+
+      scheduleListening(800);
       return;
     }
 
-    if (isRecordingTurn) {
-      const speechDuration = now - speechStartedAt;
-
-      if (speechDuration < MIN_SPEECH_MS) return;
-
-      if (!silenceStartedAt) {
-        silenceStartedAt = now;
-        return;
-      }
-
-      const silenceDuration = now - silenceStartedAt;
-
-      if (silenceDuration >= SILENCE_END_MS) {
-        stopTurnRecording();
-      }
+    if (errorName === "audio-capture" || errorName === "not-allowed") {
+      await sendBackendTextAsSpeech(
+        "I cannot hear your microphone properly. Please check your mic permission.",
+        "repeat"
+      );
+      return;
     }
-  }, VAD_CHECK_MS);
+
+    scheduleListening(1000);
+  };
+
+  recognition.onend = () => {
+    isListening = false;
+    recognition = null;
+
+    if (!isSessionActive || isProcessingTurn || isAvatarSpeaking) return;
+
+    if (!gotAnySpeech && !isRecordingTurn) {
+      scheduleListening(500);
+    }
+  };
+
+  try {
+    recognition.start();
+  } catch (err) {
+    console.error("RECOGNITION START ERROR:", err);
+    isListening = false;
+    recognition = null;
+    scheduleListening(1000);
+  }
 }
 
-function stopVadLoop() {
-  if (vadInterval) {
-    clearInterval(vadInterval);
-    vadInterval = null;
+function finishUserTurn() {
+  if (!isSessionActive) return;
+  if (isProcessingTurn) return;
+
+  clearFinalSpeechTimer();
+
+  const transcriptForControl = pendingTranscript.trim();
+
+  console.log("CONTROL TRANSCRIPT:", transcriptForControl);
+
+  stopListening();
+
+  isProcessingTurn = true;
+
+  if (!isValidControlTranscript(transcriptForControl)) {
+    if (isRecordingTurn) {
+      stopTurnRecording({ discard: true });
+    }
+
+    askUserToRepeat();
+    return;
   }
+
+  if (isRecordingTurn) {
+    stopTurnRecording();
+    return;
+  }
+
+  askUserToRepeat();
 }
 
 async function waitForPythonWsOpen(timeoutMs = 7000) {
@@ -613,40 +905,82 @@ async function waitForPythonWsOpen(timeoutMs = 7000) {
   return false;
 }
 
-async function sendTextToBackend(text, options = {}) {
-  const { processing = true } = options;
+function startBackendTurnTimeout() {
+  clearBackendTurnTimeout();
 
+  backendTurnTimeoutTimer = setTimeout(() => {
+    if (!isSessionActive) return;
+    if (!isProcessingTurn) return;
+
+    console.warn("Backend turn timeout. Returning to listening.");
+
+    isProcessingTurn = false;
+    isGreetingTurn = false;
+    isAvatarSpeaking = false;
+    currentBackendTurn = null;
+    backendAudioChunksInTurn = 0;
+    simliAudioQueue = [];
+    isPlayingSimliQueue = false;
+
+    setStatus("listening");
+    scheduleListening(500);
+  }, BACKEND_TURN_TIMEOUT_MS);
+}
+
+async function sendBackendTextAsSpeech(text, turn = "system") {
   const isOpen = await waitForPythonWsOpen();
 
   if (!isOpen) {
-    console.warn("Cannot send text. Python WS not open.");
     setStatus("backend not connected");
     return false;
   }
 
   const auth = getAuthData();
+  const voiceId = getVoiceId();
 
-avatarWs.send(
-  JSON.stringify({
-    type: "text",
+  const payload = {
+    type: turn,
+    greetingMessage: turn === "greeting",
+    greetingText: text,
     text,
+
     session_id: auth.sessionId,
     user_id: auth.userId,
-  })
-);
+    avatar_id: appConfig?.defaultAvatarId || "ai_engineer",
+    voice_id: voiceId,
+  };
 
-  isProcessingTurn = processing;
+  currentBackendTurn = turn;
+  backendAudioChunksInTurn = 0;
+  isProcessingTurn = true;
+
+  if (turn === "greeting") {
+    isGreetingTurn = true;
+  }
+
+  avatarWs.send(JSON.stringify(payload));
+
+  console.log("TEXT SPEECH SENT TO BACKEND:", {
+    type: payload.type,
+    greetingMessage: payload.greetingMessage,
+    text: payload.text,
+    session_id: payload.session_id,
+    user_id: payload.user_id,
+    avatar_id: payload.avatar_id,
+    voice_id: payload.voice_id,
+  });
+
+  startBackendTurnTimeout();
+
   return true;
 }
 
 async function sendGreeting() {
-  isGreetingTurn = true;
+  setStatus("greeting user");
 
-  return sendTextToBackend(
+  return sendBackendTextAsSpeech(
     "Hey! How can I help you today?",
-    {
-      processing: true,
-    }
+    "greeting"
   );
 }
 
@@ -660,7 +994,15 @@ async function startSession() {
     isSessionActive = true;
     isProcessingTurn = false;
     isRecordingTurn = false;
-    isUserSpeaking = false;
+    isListening = false;
+    isPythonConnected = false;
+    isSimliConnected = false;
+    isGreetingTurn = false;
+    isAvatarSpeaking = false;
+    isPlayingSimliQueue = false;
+    simliAudioQueue = [];
+    currentBackendTurn = null;
+    backendAudioChunksInTurn = 0;
 
     setStatus("loading config");
     appConfig = await loadConfig();
@@ -676,38 +1018,29 @@ async function startSession() {
     }
 
     setStatus("getting microphone");
-    await setupMicAndVad();
+    await setupMic();
 
     await sleep(500);
-
-    setStatus("greeting user");
 
     const greetingSent = await sendGreeting();
 
     if (!greetingSent) {
       isProcessingTurn = false;
+      isGreetingTurn = false;
+      isAvatarSpeaking = false;
       setStatus("listening");
+      scheduleListening(500);
     }
-
-    startVadLoop();
-
-    setTimeout(() => {
-      if (!isSessionActive) return;
-
-      if (isProcessingTurn) {
-        console.warn("Greeting timeout. Moving to listening anyway.");
-        isProcessingTurn = false;
-        setStatus("listening");
-      }
-    }, 12000);
   } catch (err) {
     console.error("START ERROR:", err);
 
     isSessionActive = false;
     isProcessingTurn = false;
     isRecordingTurn = false;
-    isUserSpeaking = false;
+    isListening = false;
     isPythonConnected = false;
+    isSimliConnected = false;
+    isAvatarSpeaking = false;
 
     startBtn.disabled = false;
     stopBtn.disabled = true;
@@ -721,10 +1054,20 @@ async function stopSession() {
     isSessionActive = false;
     isProcessingTurn = false;
     isRecordingTurn = false;
-    isUserSpeaking = false;
+    isListening = false;
     isPythonConnected = false;
+    isGreetingTurn = false;
+    isAvatarSpeaking = false;
+    isPlayingSimliQueue = false;
+    currentBackendTurn = null;
+    backendAudioChunksInTurn = 0;
+    simliAudioQueue = [];
 
-    stopVadLoop();
+    clearBackendTurnTimeout();
+    clearListenRestartTimer();
+    clearFinalSpeechTimer();
+
+    stopListening();
     stopSimliKeepAlive();
 
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
@@ -734,6 +1077,7 @@ async function stopSession() {
     }
 
     mediaRecorder = null;
+    recordedChunks = [];
 
     if (avatarWs) {
       try {
@@ -757,28 +1101,10 @@ async function stopSession() {
       simliClient = null;
     }
 
-    if (micSource) {
-      try {
-        micSource.disconnect();
-      } catch {}
-
-      micSource = null;
-    }
-
-    if (audioContext) {
-      try {
-        await audioContext.close();
-      } catch {}
-
-      audioContext = null;
-    }
-
     if (micStream) {
       micStream.getTracks().forEach((track) => track.stop());
       micStream = null;
     }
-
-    analyser = null;
 
     if (videoEl) videoEl.srcObject = null;
     if (audioEl) audioEl.srcObject = null;

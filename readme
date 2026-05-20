@@ -1,0 +1,42 @@
+// Browser SpeechRecognition = only checks speaking / unclear speech
+// MediaRecorder = records WebM/Opus
+// Frontend sends WebM to backend
+// Backend does STT + LLM + TTS
+// Backend returns timed PCM chunks
+// Frontend queues PCM chunks to Simli using duration_ms
+// Listening starts only after avatar finishes speaking
+
+// Backend guy should do these changes:
+// // accept user audio
+// {
+//   type: "user_audio",
+//   audio_base64: "<base64 webm/opus>",
+//   mime_type: "audio/webm;codecs=opus",
+//   format: "webm_opus",
+//   session_id,
+//   user_id,
+//   avatar_id,
+//   voice_id,
+//   control_transcript
+// }
+
+// Backend should convert:
+// WebM/Opus → decode → STT → LLM → TTS → PCM16 chunks
+
+
+// Backend should return:
+// { type: "audio_chunk", seq: 0, pcm_b64: "...", duration_ms: 60 }
+// { type: "audio_chunk", seq: 1, pcm_b64: "...", duration_ms: 60 }
+// { type: "audio_end", chunks_sent: 20, total_duration_ms: 1200 }
+
+// For greeting/repeat lines, backend should accept:
+// {
+//   type: "greeting", // or "repeat"
+//   text: "Hey! How can I help you today?",
+//   greetingText: "Hey! How can I help you today?",
+//   greetingMessage: true,
+//   session_id,
+//   user_id,
+//   avatar_id,
+//   voice_id
+// }

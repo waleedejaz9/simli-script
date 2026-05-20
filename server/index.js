@@ -22,6 +22,7 @@ app.get("/api/config", (req, res) => {
     pythonHttpBase: process.env.PYTHON_HTTP_BASE,
     pythonWsBase: process.env.PYTHON_WS_BASE,
     defaultAvatarId: process.env.DEFAULT_AVATAR_ID || "ai_engineer",
+    defaultVoiceId: process.env.DEFAULT_VOICE_ID || "",
   });
 });
 
