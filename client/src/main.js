@@ -47,6 +47,7 @@ let pendingTranscript = "";
 let gotAnySpeech = false;
 let currentBackendTurn = null;
 let backendAudioChunksInTurn = 0;
+let suppressPythonWsCloseHandler = false;
 
 const EXPRESS_BASE = "http://localhost:3000";
 
@@ -60,6 +61,96 @@ const audioEl = document.getElementById("avatarAudio");
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const statusEl = document.getElementById("status");
+
+async function reconnectPythonWsOnly() {
+  if (isReconnectingPythonWs) return false;
+
+  isReconnectingPythonWs = true;
+
+  try {
+    setStatus("reconnecting backend");
+
+    if (avatarWs) {
+      suppressPythonWsCloseHandler = true;
+
+      try {
+        avatarWs.onopen = null;
+        avatarWs.onmessage = null;
+        avatarWs.onerror = null;
+        avatarWs.onclose = null;
+        avatarWs.close();
+      } catch {}
+
+      avatarWs = null;
+      suppressPythonWsCloseHandler = false;
+    }
+
+    isPythonConnected = false;
+
+    await sleep(800);
+    await connectPythonAvatarWs();
+
+    isReconnectingPythonWs = false;
+
+    return avatarWs && avatarWs.readyState === WebSocket.OPEN;
+  } catch (err) {
+    console.error("RECONNECT PYTHON WS FAILED:", err);
+
+    isReconnectingPythonWs = false;
+    isPythonConnected = false;
+
+    return false;
+  }
+}
+
+async function speakFallbackWithSameVoice(text) {
+  try {
+    stopListening();
+    clearBackendTurnTimeout();
+
+    resetTurnAfterFailure();
+
+    const isOpen =
+      avatarWs && avatarWs.readyState === WebSocket.OPEN;
+
+    if (!isOpen) {
+      const reconnected = await reconnectPythonWsOnly();
+
+      if (!reconnected) {
+        setStatus("backend reconnect failed");
+        scheduleListening(1000);
+        return false;
+      }
+    }
+
+    currentBackendTurn = "fallback";
+    backendAudioChunksInTurn = 0;
+
+    await sendBackendTextAsSpeech(text, "fallback");
+
+    return true;
+  } catch (err) {
+    console.error("SAME VOICE FALLBACK ERROR:", err);
+
+    resetTurnAfterFailure();
+    setStatus("listening");
+    scheduleListening(800);
+
+    return false;
+  }
+}
+
+function resetTurnAfterFailure() {
+  clearBackendTurnTimeout();
+
+  isProcessingTurn = false;
+  isGreetingTurn = false;
+  isAvatarSpeaking = false;
+  currentBackendTurn = null;
+  backendAudioChunksInTurn = 0;
+
+  resetAudioTurnState();
+}
 
 async function reconnectPythonWsAndResume() {
   if (!isSessionActive) return;
@@ -94,7 +185,6 @@ async function reconnectPythonWsAndResume() {
     await connectPythonAvatarWs();
 
     reconnectAttempts = 0;
-    isReconnectingPythonWs = false;
 
     isProcessingTurn = false;
     isAvatarSpeaking = false;
@@ -607,12 +697,14 @@ function connectPythonAvatarWs() {
       if (!resolved) reject(err);
     };
 
-   avatarWs.onclose = (event) => {
+avatarWs.onclose = (event) => {
   console.log("PYTHON WS CLOSED");
   console.log("Close code:", event.code);
   console.log("Close reason:", event.reason);
 
   isPythonConnected = false;
+
+  if (suppressPythonWsCloseHandler) return;
 
   if (!resolved) {
     reject(new Error(`Python WS closed before open: ${event.code}`));
@@ -621,26 +713,21 @@ function connectPythonAvatarWs() {
 
   if (!isSessionActive) return;
 
-  clearBackendTurnTimeout();
+  const failedTurn = currentBackendTurn;
 
-  isProcessingTurn = false;
-  isGreetingTurn = false;
-  isAvatarSpeaking = false;
-  currentBackendTurn = null;
-  backendAudioChunksInTurn = 0;
-  resetAudioTurnState();
+  resetTurnAfterFailure();
 
   setStatus(`backend disconnected: ${event.code}`);
 
-  if (event.code === 1006) {
-    speakBrowserFallback(
-      "Sorry, I had trouble processing that. Please ask again."
-    );
+  if (event.code === 1005 || failedTurn === "fallback") {
+    reconnectPythonWsAndResume();
     return;
   }
 
-  reconnectPythonWsAndResume();
-};
+  speakFallbackWithSameVoice(
+    "Sorry, I had trouble processing that. Please ask again."
+  );
+};y
   });
 }
 
@@ -663,22 +750,32 @@ async function handleBackendAudioEnd(msg = {}) {
     msg,
   });
 
-  if (chunksFromBackend <= 0) {
-    isProcessingTurn = false;
-    isGreetingTurn = false;
-    isAvatarSpeaking = false;
-    currentBackendTurn = null;
-    backendAudioChunksInTurn = 0;
-    resetAudioTurnState();
+if (chunksFromBackend <= 0) {
+  const failedTurn = currentBackendTurn;
 
-    setStatus("backend returned no audio");
-    await sendBackendTextAsSpeech(
-  "I couldn't find enough information about that. Please ask something else.",
-  "fallback"
-);
-    scheduleListening(500);
+  resetTurnAfterFailure();
+
+  console.warn("Backend returned no audio for turn:", failedTurn);
+
+  if (failedTurn === "fallback") {
+    setStatus("fallback failed");
+
+    if (isSessionActive) {
+      setStatus("listening");
+      scheduleListening(800);
+    }
+
     return;
   }
+
+  setStatus("backend returned no audio");
+
+  await speakFallbackWithSameVoice(
+    "I couldn't find enough information about that. Please ask something else."
+  );
+
+  return;
+}
 
   setStatus("avatar finishing");
 }
