@@ -17,9 +17,15 @@ let mediaRecorder = null;
 let recordedChunks = [];
 let micStream = null;
 let recognition = null;
+let activeAudioTurnId = null;
+let expectedAudioSeq = 0;
+let pendingAudioChunks = new Map();
+let backendAudioEnded = false;
 
-let simliAudioQueue = [];
-let isPlayingSimliQueue = false;
+let isReconnectingPythonWs = false;
+let reconnectAttempts = 0;
+const MAX_WS_RECONNECT_ATTEMPTS = 3;
+
 let isAvatarSpeaking = false;
 
 let silenceInterval = null;
@@ -54,6 +60,100 @@ const audioEl = document.getElementById("avatarAudio");
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const statusEl = document.getElementById("status");
+
+async function reconnectPythonWsAndResume() {
+  if (!isSessionActive) return;
+  if (isReconnectingPythonWs) return;
+
+  isReconnectingPythonWs = true;
+  reconnectAttempts += 1;
+
+  try {
+    if (reconnectAttempts > MAX_WS_RECONNECT_ATTEMPTS) {
+      setStatus("backend reconnect failed");
+      isReconnectingPythonWs = false;
+      return;
+    }
+
+    setStatus("reconnecting backend");
+
+    if (avatarWs) {
+      try {
+        avatarWs.onopen = null;
+        avatarWs.onmessage = null;
+        avatarWs.onerror = null;
+        avatarWs.onclose = null;
+        avatarWs.close();
+      } catch {}
+
+      avatarWs = null;
+    }
+
+    await sleep(1000);
+
+    await connectPythonAvatarWs();
+
+    reconnectAttempts = 0;
+    isReconnectingPythonWs = false;
+
+    isProcessingTurn = false;
+    isAvatarSpeaking = false;
+    isGreetingTurn = false;
+    currentBackendTurn = null;
+    backendAudioChunksInTurn = 0;
+    resetAudioTurnState();
+
+    setStatus("listening");
+    scheduleListening(500);
+  } catch (err) {
+    console.error("PYTHON WS RECONNECT FAILED:", err);
+
+    isPythonConnected = false;
+    isReconnectingPythonWs = false;
+
+    setTimeout(() => {
+      reconnectPythonWsAndResume();
+    }, 1500);
+  }
+}
+
+function speakBrowserFallback(text) {
+  try {
+    window.speechSynthesis.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = "en-US";
+    utterance.rate = 1;
+
+    utterance.onstart = () => {
+      isAvatarSpeaking = true;
+      isProcessingTurn = true;
+      stopListening();
+      setStatus("speaking fallback");
+    };
+
+    utterance.onend = () => {
+      isAvatarSpeaking = false;
+      isProcessingTurn = false;
+      setStatus("listening");
+
+      reconnectPythonWsAndResume();
+    };
+
+    utterance.onerror = () => {
+      isAvatarSpeaking = false;
+      isProcessingTurn = false;
+      reconnectPythonWsAndResume();
+    };
+
+    window.speechSynthesis.speak(utterance);
+  } catch (err) {
+    console.error("BROWSER FALLBACK SPEECH ERROR:", err);
+    isAvatarSpeaking = false;
+    isProcessingTurn = false;
+    reconnectPythonWsAndResume();
+  }
+}
 
 function setStatus(text) {
   console.log("STATUS:", text);
@@ -213,8 +313,8 @@ function startSimliKeepAlive() {
     if (isProcessingTurn || isAvatarSpeaking) return;
 
     try {
-      const silence = new Int16Array(160);
-      simliClient.sendAudioData(silence);
+        const silence = new Uint8Array(640);
+        simliClient.sendAudioData(silence);
     } catch (err) {
       console.error("SIMLI KEEP ALIVE ERROR:", err);
     }
@@ -249,31 +349,62 @@ function clearFinalSpeechTimer() {
   }
 }
 
-function queueSimliAudio(pcm, durationMs = 60) {
-  simliAudioQueue.push({ pcm, durationMs });
+function sendPcmToSimli(pcm) {
+  if (!isSessionActive) return;
+  if (!simliClient || !isSimliConnected) return;
+  if (!pcm || pcm.length === 0) return;
 
-  if (!isPlayingSimliQueue) {
-    playSimliQueue();
-  }
-}
-
-async function playSimliQueue() {
-  isPlayingSimliQueue = true;
+  isProcessingTurn = true;
   isAvatarSpeaking = true;
 
   stopListening();
+  setStatus("avatar speaking");
 
-  while (simliAudioQueue.length > 0 && isSessionActive) {
-    const item = simliAudioQueue.shift();
+  try {
+    simliClient.sendAudioData(pcm);
+  } catch (err) {
+    console.error("SIMLI SEND AUDIO ERROR:", err);
+  }
+}
 
-    if (simliClient && isSimliConnected) {
-      simliClient.sendAudioData(item.pcm);
-    }
+function resetAudioTurnState() {
+  activeAudioTurnId = null;
+  expectedAudioSeq = 0;
+  pendingAudioChunks.clear();
+  backendAudioEnded = false;
+}
 
-    await sleep(item.durationMs || 60);
+function acceptBackendAudioChunk(msg) {
+  if (msg.sample_rate && Number(msg.sample_rate) !== 16000) {
+    console.warn("Invalid sample rate for Simli:", msg.sample_rate);
+    return;
   }
 
-  isPlayingSimliQueue = false;
+  if (!msg.pcm_b64) {
+    console.warn("Missing pcm_b64 in audio chunk:", msg);
+    return;
+  }
+
+  const pcm = base64ToInt16Array(msg.pcm_b64);
+
+  backendAudioChunksInTurn += 1;
+  isProcessingTurn = true;
+  isAvatarSpeaking = true;
+
+  setStatus("avatar speaking");
+
+  sendPcmToSimli(pcm);
+}
+
+function flushPendingAudioChunks() {
+  while (pendingAudioChunks.has(expectedAudioSeq)) {
+    const pcm = pendingAudioChunks.get(expectedAudioSeq);
+    pendingAudioChunks.delete(expectedAudioSeq);
+
+    sendPcmToSimli(pcm);
+    backendAudioChunksInTurn += 1;
+    expectedAudioSeq += 1;
+  }
 }
 
 async function connectSimli() {
@@ -309,7 +440,31 @@ async function connectSimli() {
     setStatus("Simli error");
     startedReject(err);
   });
+simliClient.on("speaking", () => {
+  isAvatarSpeaking = true;
+  isProcessingTurn = true;
+  stopListening();
+  setStatus("avatar speaking");
+});
 
+simliClient.on("silent", () => {
+  if (!backendAudioEnded && backendAudioChunksInTurn > 0) {
+    return;
+  }
+
+  isAvatarSpeaking = false;
+  isProcessingTurn = false;
+  isGreetingTurn = false;
+  currentBackendTurn = null;
+  backendAudioChunksInTurn = 0;
+
+  resetAudioTurnState();
+
+  if (isSessionActive) {
+    setStatus("listening");
+    scheduleListening(150);
+  }
+});
   await simliClient.start();
 
   await Promise.race([
@@ -356,10 +511,8 @@ function connectPythonAvatarWs() {
           if (!simliClient || !isSimliConnected) return;
 
           backendAudioChunksInTurn += 1;
-          isProcessingTurn = true;
-          setStatus("avatar speaking");
 
-          queueSimliAudio(new Int16Array(event.data), 60);
+          sendPcmToSimli(new Uint8Array(event.data));
           return;
         }
 
@@ -409,26 +562,8 @@ function connectPythonAvatarWs() {
           msg.type === "tts_audio_chunk" ||
           msg.type === "avatar_audio_chunk"
         ) {
-          const base64 =
-            msg.pcm_b64 ||
-            msg.audio ||
-            msg.audio_base64 ||
-            msg.data ||
-            msg.chunk;
-
-          if (!base64) {
-            console.warn("NO AUDIO BASE64 FOUND:", msg);
-            return;
-          }
-
-          const pcm = base64ToInt16Array(base64);
-
-          backendAudioChunksInTurn += 1;
-          isProcessingTurn = true;
-          setStatus("avatar speaking");
-
-          queueSimliAudio(pcm, msg.duration_ms || 60);
-          return;
+          acceptBackendAudioChunk(msg);
+  return;
         }
 
         if (
@@ -472,27 +607,48 @@ function connectPythonAvatarWs() {
       if (!resolved) reject(err);
     };
 
-    avatarWs.onclose = (event) => {
-      console.log("PYTHON WS CLOSED");
-      console.log("Close code:", event.code);
-      console.log("Close reason:", event.reason);
+   avatarWs.onclose = (event) => {
+  console.log("PYTHON WS CLOSED");
+  console.log("Close code:", event.code);
+  console.log("Close reason:", event.reason);
 
-      isPythonConnected = false;
+  isPythonConnected = false;
 
-      if (!resolved) {
-        reject(new Error(`Python WS closed before open: ${event.code}`));
-        return;
-      }
+  if (!resolved) {
+    reject(new Error(`Python WS closed before open: ${event.code}`));
+    return;
+  }
 
-      if (isSessionActive) {
-        setStatus(`backend disconnected: ${event.code}`);
-      }
-    };
+  if (!isSessionActive) return;
+
+  clearBackendTurnTimeout();
+
+  isProcessingTurn = false;
+  isGreetingTurn = false;
+  isAvatarSpeaking = false;
+  currentBackendTurn = null;
+  backendAudioChunksInTurn = 0;
+  resetAudioTurnState();
+
+  setStatus(`backend disconnected: ${event.code}`);
+
+  if (event.code === 1006) {
+    speakBrowserFallback(
+      "Sorry, I had trouble processing that. Please ask again."
+    );
+    return;
+  }
+
+  reconnectPythonWsAndResume();
+};
   });
 }
 
 async function handleBackendAudioEnd(msg = {}) {
   clearBackendTurnTimeout();
+
+  backendAudioEnded = true;
+  flushPendingAudioChunks();
 
   const chunksFromBackend =
     Number(msg.chunks_sent || msg.chunks || msg.audio_chunks || 0) ||
@@ -500,7 +656,10 @@ async function handleBackendAudioEnd(msg = {}) {
 
   console.log("BACKEND AUDIO END:", {
     currentBackendTurn,
+    activeAudioTurnId,
+    expectedAudioSeq,
     chunksFromBackend,
+    pendingChunks: pendingAudioChunks.size,
     msg,
   });
 
@@ -510,28 +669,18 @@ async function handleBackendAudioEnd(msg = {}) {
     isAvatarSpeaking = false;
     currentBackendTurn = null;
     backendAudioChunksInTurn = 0;
+    resetAudioTurnState();
 
     setStatus("backend returned no audio");
-    scheduleListening(800);
+    await sendBackendTextAsSpeech(
+  "I couldn't find enough information about that. Please ask something else.",
+  "fallback"
+);
+    scheduleListening(500);
     return;
   }
 
-  while (isPlayingSimliQueue || simliAudioQueue.length > 0) {
-    await sleep(100);
-  }
-
-  await sleep(300);
-
-  isAvatarSpeaking = false;
-  isProcessingTurn = false;
-  isGreetingTurn = false;
-  currentBackendTurn = null;
-  backendAudioChunksInTurn = 0;
-
-  if (isSessionActive) {
-    setStatus("listening");
-    scheduleListening(300);
-  }
+  setStatus("avatar finishing");
 }
 
 async function setupMic() {
@@ -604,24 +753,17 @@ function startTurnRecording() {
       currentBackendTurn = "user";
       backendAudioChunksInTurn = 0;
 
-      const payload = {
-        type: "user_audio",
-        audio_base64: base64Audio,
-        mime_type: mediaRecorder.mimeType || "audio/webm",
-        format: "webm_opus",
-
-        session_id: auth.sessionId,
-        user_id: auth.userId,
-        avatar_id: appConfig?.defaultAvatarId || "ai_engineer",
-
-        voice_id: voiceId,
-        voiceId: voiceId,
-        avatar_voice_id: voiceId,
-        tts_voice_id: voiceId,
-        elevenlabs_voice_id: voiceId,
-
-        control_transcript: pendingTranscript.trim(),
-      };
+    const payload = {
+  type: "user_audio",
+  audio_base64: base64Audio,
+  mime_type: mediaRecorder.mimeType || "audio/webm",
+  format: "webm_opus",
+  session_id: auth.sessionId,
+  user_id: auth.userId,
+  avatar_id: appConfig?.defaultAvatarId || "ai_engineer",
+  voice_id: voiceId,
+  control_transcript: pendingTranscript.trim(),
+};
 
       avatarWs.send(JSON.stringify(payload));
 
@@ -919,8 +1061,6 @@ function startBackendTurnTimeout() {
     isAvatarSpeaking = false;
     currentBackendTurn = null;
     backendAudioChunksInTurn = 0;
-    simliAudioQueue = [];
-    isPlayingSimliQueue = false;
 
     setStatus("listening");
     scheduleListening(500);
@@ -999,8 +1139,6 @@ async function startSession() {
     isSimliConnected = false;
     isGreetingTurn = false;
     isAvatarSpeaking = false;
-    isPlayingSimliQueue = false;
-    simliAudioQueue = [];
     currentBackendTurn = null;
     backendAudioChunksInTurn = 0;
 
@@ -1058,10 +1196,8 @@ async function stopSession() {
     isPythonConnected = false;
     isGreetingTurn = false;
     isAvatarSpeaking = false;
-    isPlayingSimliQueue = false;
     currentBackendTurn = null;
     backendAudioChunksInTurn = 0;
-    simliAudioQueue = [];
 
     clearBackendTurnTimeout();
     clearListenRestartTimer();
